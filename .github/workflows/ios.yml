@@ -1,0 +1,78 @@
+name: iOS (unsigned IPA)
+
+# 手动跑一次，打出未签名的 .ipa；下载后用自己的 Apple ID（AltStore / SideStore / Xcode）签名装到手机上。
+# 不需要付费开发者账号，CI 里不放任何 Apple 凭证。
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: "true"
+
+jobs:
+  ios:
+    name: iOS (unsigned .ipa)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 版本号
+        id: ver
+        shell: bash
+        run: |
+          V="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ios
+
+      - run: pnpm install --frozen-lockfile
+
+      # --no-sign 是 CLI 2.11+ 才有的参数，仓库锁的是 2.10.1；
+      # Rust 侧 tauri 已是 2.12.5、@tauri-apps/api 是 2.12.4，只把 CLI 提到 2.12.0 对齐（仅改 runner 里的副本，不提交）。
+      - name: 升级 Tauri CLI 到 2.12（为 --no-sign）
+        run: pnpm add -D @tauri-apps/cli@2.12.0
+
+      - name: 准备 iOS 构建工具
+        run: |
+          brew install xcodegen
+          command -v pod >/dev/null || brew install cocoapods
+          xcodegen --version
+          pod --version || true
+
+      - name: 生成 Xcode 工程
+        run: pnpm tauri ios init --ci
+
+      - name: 构建未签名 .ipa
+        run: pnpm tauri ios build --no-sign
+
+      - name: 收集产物
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          IPA="$(find src-tauri/gen/apple/build -name '*.ipa' | head -1)"
+          if [ -z "$IPA" ]; then echo "::error::没有找到 .ipa"; exit 1; fi
+          cp "$IPA" "artifacts/HGhub_${{ steps.ver.outputs.version }}_unsigned.ipa"
+          ls -lh artifacts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-unsigned
+          path: artifacts/*
+          if-no-files-found: error
