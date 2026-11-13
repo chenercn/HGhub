@@ -1,7 +1,8 @@
 import React, { useEffect, useRef, useState } from "react";
 import Hls from "hls.js";
 import { fmtTime, platform, playlist } from "../api";
-import { mediaResource, observeHls, usePlayerDiagnostics } from "../playbackDiagnostics";
+import { mediaErrorMessage } from "../mediaErrors";
+import { mediaHost, mediaResource, observeHls, usePlayerDiagnostics } from "../playbackDiagnostics";
 import { usePlaybackActivity } from "../usePlaybackActivity";
 import { useSeekInput } from "../useSeekInput";
 import PlaybackLock from "./PlaybackLock";
@@ -60,10 +61,11 @@ export default function Player({
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !src) return;
-    const url = playlist(src);
-    recoverCountRef.current = 0;
     setErrMsg("");
-    trace("source.load", { engine: Hls.isSupported() ? "hls.js" : "native", auto_play: autoPlay });
+    setWaiting(false);
+    recoverCountRef.current = 0;
+    const url = playlist(src);
+    trace("source.load", { engine: Hls.isSupported() ? "hls.js" : "native", auto_play: autoPlay, resource: mediaResource(src), host: mediaHost(src) });
 
     if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
 
@@ -73,6 +75,7 @@ export default function Player({
         interstitialsController: undefined,
         contentSteeringController: undefined,
         enableInterstitialPlayback: false,
+        // WKWebView 里 hls.js 的 worker 不稳，iOS 关掉
         enableWorker: platform !== "ios",
         // Keep the same macOS seek workaround as the shared player.
         preferManagedMediaSource: false,
@@ -148,6 +151,13 @@ export default function Player({
     video.muted = muted;
   }, [muted]);
 
+  // iOS 内联播放：部分 WKWebView 只认 HTML 属性，不认 React 的 playsInline
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.setAttribute("webkit-playsinline", "true");
+  }, []);
+
   useEffect(() => {
     const onFs = () => setFull(!!document.fullscreenElement);
     document.addEventListener("fullscreenchange", onFs);
@@ -186,7 +196,6 @@ export default function Player({
         ref={videoRef}
         poster={poster}
         playsInline
-        webkit-playsinline="true"
         preload="auto"
         muted={muted}
         loop={loop}
@@ -200,6 +209,12 @@ export default function Player({
         onTimeUpdate={(e) => setTime((e.target as HTMLVideoElement).currentTime)}
         onLoadedMetadata={(e) => setDuration((e.target as HTMLVideoElement).duration || 0)}
         onEnded={() => { if (activity.isActive()) onEnded?.(); }}
+        onError={() => {
+          if (hlsRef.current) return;
+          setWaiting(false);
+          setPlaying(false);
+          setErrMsg(mediaErrorMessage(videoRef.current?.error ?? null));
+        }}
       />
 
       {errMsg && (

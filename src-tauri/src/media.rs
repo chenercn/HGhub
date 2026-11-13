@@ -20,7 +20,10 @@ use tauri::http::{Response, StatusCode};
 /// 前端 `src/api.ts` 的 `LOCAL` 必须与此一致，否则封面与视频全部加载失败。
 #[cfg(any(target_os = "windows", target_os = "android"))]
 pub const LOCAL_ORIGIN: &str = "http://hg.localhost";
-#[cfg(not(any(target_os = "windows", target_os = "android")))]
+/// Linux 走 loopback HTTP：WebKitGTK 的播放器是 GStreamer，它拿不到自定义 scheme。
+#[cfg(target_os = "linux")]
+pub const LOCAL_ORIGIN: &str = crate::linux_http::ORIGIN;
+#[cfg(not(any(target_os = "windows", target_os = "android", target_os = "linux")))]
 pub const LOCAL_ORIGIN: &str = "hg://localhost";
 
 const IMG_KEY: &[u8] = b"f5d965df75336270";
@@ -30,6 +33,7 @@ static IMG_CACHE: Lazy<Mutex<HashMap<String, Arc<Vec<u8>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static PL_CACHE: Lazy<Mutex<HashMap<String, Arc<String>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+/// AES Key / 分片：拖进度条时同一 key、同一片会被反复拉，缓存住省一次往返。
 static KEY_CACHE: Lazy<Mutex<HashMap<String, (String, Arc<Vec<u8>>)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static SEG_CACHE: Lazy<Mutex<HashMap<String, (String, Arc<Vec<u8>>)>>> =
@@ -193,6 +197,7 @@ fn rewrite_uri_attr(line: &str, prefix: &str) -> String {
 
 /// 取 m3u8 并把 key / 子列表 / 分片地址改写到本地协议。
 pub async fn load_playlist(url: &str, prefix: &str) -> Result<Arc<String>, String> {
+    // 缓存 key 要带 prefix：同一份 m3u8 在不同 scheme 下改写结果不一样
     let cache_key = format!("{prefix}|{url}");
     if let Some(hit) = PL_CACHE.lock().unwrap().get(&cache_key).cloned() {
         return Ok(hit);
@@ -259,7 +264,7 @@ fn absolutize_uri_in_attr(base: &str, line: &str) -> String {
     map_uri_attributes(line, |uri| absolutize(base, uri))
 }
 
-/// 加载分片或 AES Key（带内存缓存，避免拖动进度条时重复拉取同一 Key 或分片导致卡顿）。
+/// 分片 / AES Key 带内存缓存：拖动进度条时避免重复拉取同一片造成卡顿。
 pub async fn load_segment(url: &str) -> Result<(Option<String>, Arc<Vec<u8>>), String> {
     if let Some((ctype, hit)) = KEY_CACHE.lock().unwrap().get(url).cloned() {
         return Ok((Some(ctype), hit));
@@ -288,12 +293,20 @@ pub async fn load_segment(url: &str) -> Result<(Option<String>, Arc<Vec<u8>>), S
     Ok((Some(mime), arc))
 }
 
-/// 清空封面 / 播放列表 / 分片内存缓存
+/// 清空封面 / 播放列表 / Key / 分片内存缓存
 pub fn clear_caches() {
-    if let Ok(mut g) = IMG_CACHE.lock() { g.clear(); }
-    if let Ok(mut g) = PL_CACHE.lock() { g.clear(); }
-    if let Ok(mut g) = KEY_CACHE.lock() { g.clear(); }
-    if let Ok(mut g) = SEG_CACHE.lock() { g.clear(); }
+    if let Ok(mut g) = IMG_CACHE.lock() {
+        g.clear();
+    }
+    if let Ok(mut g) = PL_CACHE.lock() {
+        g.clear();
+    }
+    if let Ok(mut g) = KEY_CACHE.lock() {
+        g.clear();
+    }
+    if let Ok(mut g) = SEG_CACHE.lock() {
+        g.clear();
+    }
 }
 
 /* ───────────────────────── 协议响应 ───────────────────────── */
@@ -303,8 +316,10 @@ fn respond(status: u16, ctype: &str, body: Vec<u8>, cache: &str) -> Response<Vec
     Response::builder()
         .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
         .header("Content-Type", ctype)
+        // WKWebView 需要 Content-Length / Accept-Ranges 才肯复用已缓冲的分片
         .header("Content-Length", len)
         .header("Accept-Ranges", "bytes")
+        .header("Access-Control-Expose-Headers", "Content-Length, Content-Type, Accept-Ranges")
         .header("X-Content-Type-Options", "nosniff")
         .header("Access-Control-Expose-Headers", "Content-Length, Content-Type, Accept-Ranges")
         .header("Cache-Control", cache)
@@ -390,9 +405,7 @@ pub async fn handle(path: &str, query: &str, origin: &str) -> Response<Vec<u8>> 
             Err(e) => respond(502, "text/plain", e.into_bytes(), "no-store"),
         },
         "/seg" => match load_segment(&target).await {
-            Ok((ctype, bytes)) => {
-                segment_response(&target, ctype.as_deref(), bytes.as_ref().clone(), origin)
-            }
+            Ok((ctype, bytes)) => segment_response(&target, ctype.as_deref(), bytes.as_ref().clone(), origin),
             Err(e) => respond(502, "text/plain", e.into_bytes(), "no-store"),
         },
         _ => respond(404, "text/plain", b"not found".to_vec(), "no-store"),
@@ -441,7 +454,9 @@ mod tests {
         );
         let body = std::str::from_utf8(response.body()).unwrap();
         assert_eq!(body.matches(&format!("{LOCAL_ORIGIN}/seg?u=")).count(), 4);
-        assert!(!body.contains("URI=\"http://127.0.0.1"));
+        // Linux 上 LOCAL_ORIGIN 本身就是 `http://127.0.0.1:<port>`，
+        // 所以不能断言「不含 127.0.0.1」，要断言上游那条 key 地址已被代理包起来
+        assert!(!body.contains("URI=\"http://127.0.0.1/key\""));
         assert!(body.contains("https%3A%2F%2Fcdn%2Eexample%2Faudio%2Flist%2Em3u8"));
         assert_eq!(
             response.headers()["Content-Type"],
