@@ -21,6 +21,8 @@ jobs:
           git remote add hghubx-remote https://github.com/zxsos/HGhubX.git
           git fetch hghubx-remote main
           git merge --no-ff --no-commit -X theirs hghubx-remote/main
+          git rm -r -q --cached .github/workflows/
+          rm -rf .github/workflows/
           git checkout HEAD -- .github/workflows/
           git commit -m "Merge zxsos/HGhubX main into hghubx"
           git push origin hghubx
